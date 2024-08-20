@@ -3,14 +3,17 @@ import torch.nn as nn
 from torch.nn import functional as F 
 
 #hyperparameters
-batch_size = 32 #how many chunks we will process at 1 time?
-block_size = 8 #size of chunk, sequence length, context length
+batch_size = 64 #how many chunks we will process at 1 time?
+block_size = 256 #size of chunk, sequence length, context length
 max_iters = 5000
 eval_interval = 500
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters =200
-n_embd = 32
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
 
 #reproduceability
 torch.manual_seed(1337)
@@ -77,6 +80,9 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
+
     def forward(self, x):
         B,T,C = x.shape
         k = self.key(x)
@@ -84,6 +90,8 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2,-1) * C**-0.5
         wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+
+        wei = self.dropout(wei)
 
         v = self.value(x)
         out = wei @ v
@@ -95,10 +103,50 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
 
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            #we take multiplication of 4 based on the transformer paper
+            #section 3.3, output of d (subs-model) is 512,
+            #inner layer, d subs (ff) = 2048
+            nn.Linear(4 * n_embd, n_embd),
+            #we are adding dropout back into residual pathway before residual connections
+            nn.Dropout(dropout),
+        )
+
+    def forward (self, x):
+        return self.net(x)
+
+
+#THIS IS THE ARCHITECTURE BLOCK OF ALL COMPUTATION & 'COMMUNICATION' BETWEEN TOKENS PUT TOGETHER
+class Block(nn.Module):
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.Ln1 = nn.LayerNorm(n_embd)
+        self.Ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        #we are adding to support optimization as this network is getting very deep
+        #adding is like having skip connections during back propagation
+        #back propagation from activation to very first input layer
+        x = x + self.sa(self.Ln1(x))
+        x = x + self.ffwd(self.Ln2(x))
+        return x
 
 
 #bigram model
@@ -111,7 +159,8 @@ class BigramLanguageModel(nn.Module):
         #each row is a token from the vocab that is embedded
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) #num of embedding dims
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_heads = MultiHeadAttention(4, n_embd//4)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range in (n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -121,7 +170,10 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) #(B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
-        x = self.sa_heads(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        #this is to allow more time and computation between tokens
+        #and their relationships before decoding
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
